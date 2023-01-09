@@ -1,0 +1,102 @@
+ARG JAVA_VER=17.0.5
+
+FROM ubuntu:focal-20221130 AS build
+ARG JAVA_VER
+
+SHELL ["/bin/bash", "-c"]
+
+RUN useradd -ms /bin/bash lichess \
+    && apt-get update \
+    && apt update \
+    && apt-get install -y sudo gnupg ca-certificates\
+    # Disable sudo login for the new lichess user.
+    && echo "lichess ALL = NOPASSWD : ALL" >> /etc/sudoers
+
+ENV TZ=Etc/GMT
+RUN sudo ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && sudo echo $TZ > /etc/timezone
+
+# Run as a non-privileged user.
+USER lichess
+
+ADD build /home/lichess/build
+
+# mongodb
+RUN sudo apt-key add /home/lichess/build/signatures/mongodb.asc \
+  && echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/5.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org.list
+
+RUN sudo apt-get update && sudo apt update \
+  && sudo apt-get install -y \
+  unzip \
+  zip \
+  curl \
+#  mongodb-org \ 
+  parallel \ 
+  && sudo apt install -y \ 
+  redis-server \
+  git-all \
+  vim
+
+# nvm => node => pnpm
+RUN source /home/lichess/build/nvm-install.sh \
+  && export NVM_DIR="$HOME/.nvm" \
+  && source "$NVM_DIR/nvm.sh" \
+  && nvm install 19 \
+  && npm install -g pnpm
+
+# Java
+RUN /home/lichess/build/sdkman-init.sh \
+  && source /home/lichess/.sdkman/bin/sdkman-init.sh \
+  && sdk install java ${JAVA_VER}-tem && sdk install sbt
+
+# Silence the parallel citation warning.
+RUN sudo mkdir -p ~/.parallel && sudo touch ~/.parallel/will-cite
+
+# Git cloning instructions from
+# https://github.com/lichess-org/lila/wiki/Lichess-Development-Onboarding [Accessed 2023-01-07]
+
+WORKDIR /home/lichess
+# Clone main lila repo
+RUN git clone --recursive https://github.com/lichess-org/lila.git
+# Clone lila-ws repo
+RUN git clone https://github.com/lichess-org/lila-ws.git
+
+RUN sudo touch /etc/environment.d/90-sdkman.conf && \
+  sudo touch /etc/environment.d/90-nvm.conf && \
+  sudo bash -c "echo '/home/lichess/.sdkman/candidates/sbt/current/bin:/home/lichess/.sdkman/candidates/java/current/bin' > /etc/environment.d/90-sdkman.conf" && \
+  sudo bash -c "echo '/home/lichess/.nvm/versions/node/v19.4.0/bin' > /etc/environment.d/90-nvm.conf"
+
+ENV PATH "$PATH:/home/lichess/.sdkman/candidates/sbt/current/bin:/home/lichess/.sdkman/candidates/java/current/bin:/home/lichess/.nvm/versions/node/v19.4.0/bin"
+
+#WORKDIR /home/lichess/lila
+#RUN ./ui/build
+#RUN ./lila compile
+
+#  mongosh lichess < bin/mongodb/indexes.js && \
+  # Previous step seeds the database with indices -- otherwise it won't do anything
+
+# Make directories for mongodb
+# RUN sudo mkdir -p /data/db && sudo chmod 666 /data/db
+
+# Cleanup
+RUN sudo apt-get autoremove -y \
+  && sudo apt-get clean \
+  && sudo rm -rf /home/lichess/build \
+  && rm -R /home/lichess/.sdkman \
+  && rm -R /home/lichess/.nvm
+
+ADD run.sh /home/lichess/run.sh
+
+# SO FAR it seems like this works, but it recompiles everything -- can version matching help?
+FROM sbtscala/scala-sbt:eclipse-temurin-${JAVA_VER}_8_1.8.2_2.13.10 as main
+
+RUN mkdir /home/lichess
+
+COPY --from=build /home/lichess /home/lichess
+
+# Use UTF-8 encoding.
+ENV LANG "en_US.UTF-8"
+ENV LC_CTYPE "en_US.UTF-8"
+
+WORKDIR /home/lichess
+
+ENTRYPOINT ./run.sh
